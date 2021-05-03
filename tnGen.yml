@@ -1,0 +1,235 @@
+AWSTemplateFormatVersion: "2010-09-09"
+
+
+Description: Thumbnail generator application stack template
+
+
+Parameters:
+
+  QueueName:
+    Type: String
+    Description: SQS Queue Name
+    Default: tn-gen-queue
+
+  BucketName:
+    Type: String
+    Description: S3 Bucket Name
+    Default: tn-gen-bucket
+
+  MachineType:
+    Type: String
+    Description: EC2 instance type
+    AllowedValues : ["t2.micro", "m1.small", "m1.large"]
+    Default: t2.micro
+
+  KeyPairName: 
+    Type: AWS::EC2::KeyPair::KeyName
+    Description: Amazon EC2 Key Pair
+
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: VPC ID for EC2 instance
+
+  UserIP:
+    Type: String
+    Description: Public IPv4 address of user machine for whitelisting
+    Default: 0.0.0.0/0
+
+  RunType:
+    Type: String
+    Description: Type of action to perform in machine
+    AllowedValues: ["Install", "Update"]
+    Default: Update
+
+  InfraBucketName:
+    Type: String
+    Description: Name of S3 bucket where source code files are stored
+    AllowedPattern : ".+"
+
+  CreateBucket:
+    Type: String
+    Description: Whether create a new data bucket if not already created
+    AllowedValues: ["YES", "NO"]
+    Default: "NO"
+
+
+Mappings:
+  ImagesMap:
+    t2.micro:
+      "default": ami-04bf6dcdc9ab498ca
+    m1.small:
+      "default": ami-04bf6dcdc9ab498ca
+    m1.large:
+      "default": ami-04bf6dcdc9ab498ca
+
+
+Conditions:
+  CreateBucket:
+    !Equals [!Ref CreateBucket, YES]
+
+
+Resources:
+
+  # SQS
+  TnGenQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Ref QueueName
+
+  TnGenQueuePolicy:
+    Type: AWS::SQS::QueuePolicy
+    Properties:
+      Queues:
+      - !Ref TnGenQueue
+      PolicyDocument:
+        Statement:
+        - Action:
+          - SQS:SendMessage
+          Effect: Allow
+          Resource: !Join [ ":", [ "arn:aws:sqs", !Ref "AWS::Region" , !Ref "AWS::AccountId", !Ref QueueName ] ]
+          Condition:
+            ArnLike:
+              aws:SourceArn: !Join [ "", ["arn:aws:s3:*:*:", !Ref BucketName ] ]
+          Principal:
+            AWS:
+              "*"
+    DependsOn:
+    - TnGenQueue
+
+  # S3
+  TnGenBucket:
+    Type: AWS::S3::Bucket
+    Condition: CreateBucket
+    Properties:
+      BucketName: !Ref BucketName
+      NotificationConfiguration:
+        QueueConfigurations:
+        - Event: 's3:ObjectCreated:Put'
+          Queue: !Join [ ":", [ "arn:aws:sqs", !Ref "AWS::Region" , !Ref "AWS::AccountId", !Ref QueueName ] ]
+          Filter:
+            S3Key:
+              Rules:
+              - Name: prefix
+                Value: ToProcess/
+              - Name: suffix
+                Value: .jpg
+    DependsOn:
+    - TnGenQueue
+    - TnGenQueuePolicy
+
+  # IAM
+  TnGenIAMProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Path: /
+      Roles:
+      - !Ref TnGenIAMRole
+    DependsOn:
+    - TnGenIAMRole
+
+  TnGenIAMRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service:
+            - ec2.amazonaws.com
+          Action:
+            - sts:AssumeRole
+      Path: /   
+      Policies:
+      - PolicyName: tn-gen-policy-ec2
+        PolicyDocument:
+          Statement:
+          - Effect: Allow
+            Action: "*"
+            Resource: "*"
+
+  # Security Group
+  TnGenSshSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: tn-gen-security
+      GroupDescription: Enable SSH access via port 22
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+      - CidrIp: !Ref UserIP
+        FromPort: 22
+        IpProtocol: tcp
+        ToPort: 22
+      SecurityGroupEgress:
+      - CidrIp: 0.0.0.0/0
+        IpProtocol: tcp
+        FromPort: 0
+        ToPort: 65535
+
+  # EC2
+  TnGenInstance:
+    Type: AWS::EC2::Instance
+    Properties:
+      ImageId: !FindInMap
+        - ImagesMap
+        - !Ref MachineType
+        - default
+      InstanceType: !Ref MachineType
+      KeyName: !Ref KeyPairName
+      IamInstanceProfile: !Ref TnGenIAMProfile
+      SecurityGroupIds:
+      - !Ref TnGenSshSecurityGroup
+      UserData:
+        "Fn::Base64":
+          !Sub |
+            #! /bin/bash -xe
+            # Get the latest CloudFormation package
+            yum update -y aws-cfn-bootstrap
+            # Start cfn-init
+            /opt/aws/bin/cfn-init -s ${AWS::StackId} -r TnGenInstance -c ${RunType} --region ${AWS::Region} || error_exit 'Failed to run cfn-init'
+            # All done so signal success
+            /opt/aws/bin/cfn-signal -e $? --stack ${AWS::StackId} --resource TnGenInstance --region ${AWS::Region}
+
+    Metadata:
+      AWS::CloudFormation::Init:
+        configSets:
+          Install:
+          - configBootStrap
+          - ConfigSet: Update
+          Update:
+          - configExecute
+        configBootStrap:
+          files:
+            "/tmp/tnLaunchScript.sh":
+              source: !Join [ "", ["https://", !Ref InfraBucketName, ".s3.amazonaws.com", "/tnLaunchScript.sh" ] ]
+              mode: "000755"
+              owner: root
+              group: root
+          commands:
+            tnGenLaunchScript:
+              command: "sh tnLaunchScript.sh"
+              cwd: "/tmp"
+        configExecute:
+          files:
+            "/tmp/tnProcessor.py":
+              source: !Join [ "", ["https://", !Ref InfraBucketName, ".s3.amazonaws.com", "/tnProcessor.py" ] ]
+              mode: "000755"
+              owner: root
+              group: root
+            "/tmp/tnExecuteScript.sh":
+              source: !Join [ "", ["https://", !Ref InfraBucketName, ".s3.amazonaws.com", "/tnExecuteScript.sh" ] ]
+              mode: "000755"
+              owner: root
+              group: root
+          commands:
+            tnGenRunScript:
+              command: "sh tnExecuteScript.sh"
+              cwd: "/tmp"
+    DependsOn:
+    - TnGenSshSecurityGroup
+    - TnGenIAMProfile
+
+
+Outputs:
+  MachineDNS:
+    Description: Public DNS name of EC2 instance created
+    Value: !GetAtt TnGenInstance.PublicDnsName
